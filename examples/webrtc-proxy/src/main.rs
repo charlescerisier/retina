@@ -10,6 +10,7 @@ use retina::{
 };
 use std::{str::FromStr, sync::Arc};
 use structopt::StructOpt;
+use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 use webrtc::{
     api::{interceptor_registry::register_default_interceptors, APIBuilder},
     ice_transport::{ice_connection_state::RTCIceConnectionState, ice_server::RTCIceServer},
@@ -20,7 +21,10 @@ use webrtc::{
         sdp::session_description::RTCSessionDescription,
     },
     rtp_transceiver::rtp_codec::RTCRtpCodecCapability,
-    track::track_local::{track_local_static_sample::TrackLocalStaticSample, TrackLocal},
+    track::track_local::{
+        track_local_static_sample::TrackLocalStaticSample, TrackLocal, TrackLocalWriter,
+    },
+    util::Unmarshal
 };
 
 /// Proxies from the given RTSP server to a WebRTC client.
@@ -159,17 +163,7 @@ async fn run() -> Result<(), Error> {
         //    webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRtp.)
         //    This only works if the upstream and downstream agree on an
         //    acceptable MTU.
-        // 2. Pass whole frames (aka samples or H.264 access units). (From
-        //    retina::client::Demuxed's Stream impl to
-        //    webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample.)
-        //    This introduces a slight lag if it takes a long time to receive a
-        //    complete frame from upstream.
-        // 3. Repacketize on-the-fly, buffering upstream packets and flushing
-        //    every downstream MTU, buffering at most
-        //    max(upstream MTU, downstream MTU) bytes.
-        //
-        // #3 seems ideal but is not yet implemented. The current approach is #2.
-        let track = Arc::new(TrackLocalStaticSample::new(
+        let track = Arc::new(TrackLocalStaticRTP::new(
             RTCRtpCodecCapability {
                 mime_type: "video/h264".to_owned(),
                 ..Default::default()
@@ -180,6 +174,28 @@ async fn run() -> Result<(), Error> {
         let sender = downstream_conn
             .add_track(Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>)
             .await?;
+
+        // 2. Pass whole frames (aka samples or H.264 access units). (From
+        //    retina::client::Demuxed's Stream impl to
+        //    webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample.)
+        //    This introduces a slight lag if it takes a long time to receive a
+        //    complete frame from upstream.
+        // 3. Repacketize on-the-fly, buffering upstream packets and flushing
+        //    every downstream MTU, buffering at most
+        //    max(upstream MTU, downstream MTU) bytes.
+        //
+        // #3 seems ideal but is not yet implemented. The current approach is #2.
+        // let track = Arc::new(TrackLocalStaticSample::new(
+        //     RTCRtpCodecCapability {
+        //         mime_type: "video/h264".to_owned(),
+        //         ..Default::default()
+        //     },
+        //     format!("{}-video", i),
+        //     "retina-webrtc-proxy".to_owned(),
+        // ));
+        // let sender = downstream_conn
+        //     .add_track(Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>)
+        //     .await?;
 
         // Read incoming RTCP packets
         // Before these packets are returned they are processed by interceptors. For things
@@ -208,8 +224,8 @@ async fn run() -> Result<(), Error> {
 
     let mut upstream_session = upstream_session
         .play(retina::client::PlayOptions::default().ignore_zero_seq(true))
-        .await?
-        .demuxed()?;
+        .await?;
+    // .demuxed()?;
 
     // Set the handler for ICE connection state
     // This will notify you when the peer has connected/disconnected
@@ -253,22 +269,10 @@ async fn run() -> Result<(), Error> {
         tokio::select! {
             item = upstream_session.next() => {
                 match item {
-                    Some(Ok(CodecItem::VideoFrame(f))) => {
-                        if let Some(t) = tracks.get(f.stream_id()).and_then(Option::as_ref) {
-                            t.write_sample(&Sample {
-                                data: convert_h264(f)?.into(),
-
-                                // TODO: webrtc-rs appears to calculate the
-                                // timestamp from this frame's duration:
-                                // https://github.com/webrtc-rs/webrtc/blob/7681d923f216e281f86ca6e453529b9853eeceab/src/track/track_local/track_local_static_sample.rs#L65
-                                // https://github.com/webrtc-rs/rtp/blob/ef3be6febc7d4b261c2ad991cb4e467bb80ccce0/src/packetizer/mod.rs#L137
-                                // which is wrong and unknowable without lagging
-                                // a frame. The timestamp really should be based
-                                // on time elapsed since the *previous* frame;
-                                // maybe supply that here...
-                                duration: tokio::time::Duration::from_secs(1),
-                                ..Default::default()
-                            }).await?;
+                    Some(Ok(retina::client::PacketItem::Rtp(pkt))) => {
+                        if let Some(t) = tracks.get(pkt.stream_id()).and_then(Option::as_ref) {
+                            let raw_pkt = webrtc::rtp::packet::Packet::unmarshal(&mut pkt.raw()).unwrap();
+                            t.write_rtp(&raw_pkt).await?;
                         }
                     },
                     Some(Ok(_)) => {},
